@@ -48,17 +48,36 @@ class TeleopState:
         self.vx_s = 0.0
         self.vy_s = 0.0
         self.wz_s = 0.0
-        # Sit mode
+        # Sit mode — full PD override of all legs
         self.is_sitting = False
+        self.sit_blend = 0.0  # 0=standing, 1=fully sitting (smooth transition)
         # Front leg mode (L bumper held, or F toggle for keyboard)
         self.front_leg_mode = False
-        self.front_leg_rx = 0.0  # right stick X / J/L keys (hip abduction)
-        self.front_leg_ry = 0.0  # right stick Y / I/K keys (thigh)
+        self.front_leg_hip = 0.0    # J/L keys — hip abduction offset
+        self.front_leg_thigh = 0.0  # I/K keys — thigh offset
+        self.front_leg_calf = 0.0   # U/O keys — calf offset
         # Reset request
         self.reset_requested = False
+        # Controller ref (set after construction)
+        self.controller = None
 
 
-def gamepad_thread(env, cfg, state):
+# Go2 sitting joint targets (from build_scene.py keyframe, adapted for flat ground)
+SIT_TARGETS = {
+    "FL": np.array([0.0,  0.88, -0.94]),    # front: paws forward, moderate knee
+    "FR": np.array([0.0,  0.88, -0.94]),
+    "RL": np.array([0.0,  1.95, -2.723]),   # rear: thigh horizontal, calf tucked
+    "RR": np.array([0.0,  1.95, -2.723]),
+}
+STAND_TARGETS = {
+    "FL": np.array([0.0, 0.9, -1.8]),
+    "FR": np.array([0.0, 0.9, -1.8]),
+    "RL": np.array([0.0, 0.9, -1.8]),
+    "RR": np.array([0.0, 0.9, -1.8]),
+}
+
+
+def gamepad_thread(env, cfg, state, controller):
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     import pygame
     pygame.display.init()
@@ -81,15 +100,34 @@ def gamepad_thread(env, cfg, state):
         pygame.event.pump()
 
         # Check L bumper for front leg mode
+        was_leg_mode = state.front_leg_mode
         state.front_leg_mode = js.get_button(BTN_L)
 
         if state.front_leg_mode:
-            # In front leg mode, right stick controls front legs
-            state.front_leg_rx = apply_deadzone(js.get_axis(AX_RX))
-            state.front_leg_ry = apply_deadzone(js.get_axis(AX_RY))
+            # Enter full_stance on first press to prevent MPC fight
+            if not was_leg_mode:
+                from quadruped_pympc.helpers.quadruped_utils import GaitType
+                pgg = controller.wb_interface.pgg
+                if pgg.gait_type != GaitType.FULL_STANCE.value:
+                    state.vx_s = state.vy_s = state.wz_s = 0.0
+                    if env._ref_base_lin_vel_H is not None:
+                        env._ref_base_lin_vel_H[:] = 0.0
+                    env._ref_base_ang_yaw_dot = 0.0
+                    pgg.set_full_stance()
+            # Right stick X = hip, right stick Y = thigh, ZL/ZR = calf
+            state.front_leg_hip = apply_deadzone(js.get_axis(AX_RX))
+            state.front_leg_thigh = apply_deadzone(js.get_axis(AX_RY))
+            if js.get_button(BTN_ZL):
+                state.front_leg_calf = max(state.front_leg_calf - 0.02, -1.0)
+            elif js.get_button(BTN_ZR):
+                state.front_leg_calf = min(state.front_leg_calf + 0.02, 1.0)
         else:
-            state.front_leg_rx = 0.0
-            state.front_leg_ry = 0.0
+            if was_leg_mode and not state.is_sitting:
+                # Restore gait when releasing L bumper
+                controller.wb_interface.pgg.restore_previous_gait()
+            state.front_leg_hip = 0.0
+            state.front_leg_thigh = 0.0
+            state.front_leg_calf = 0.0
 
         # Left stick: locomotion
         lx = apply_deadzone(js.get_axis(AX_LX))
@@ -118,12 +156,29 @@ def gamepad_thread(env, cfg, state):
             env._ref_base_lin_vel_H[1] = np.clip(state.vy_s, -max_lin, max_lin)
         env._ref_base_ang_yaw_dot = np.clip(state.wz_s, -max_ang, max_ang)
 
-        # A: zero all velocities (e-stop)
+        # Auto-resume gait if stick is moved while in full stance
+        if (abs(vx_t) > 0 or abs(vy_t) > 0 or abs(wz_t) > 0) and controller is not None:
+            from quadruped_pympc.helpers.quadruped_utils import GaitType
+            pgg = controller.wb_interface.pgg
+            if pgg.gait_type == GaitType.FULL_STANCE.value:
+                pgg.restore_previous_gait()
+                print("  [GAIT RESUMED]")
+
+        # A: zero velocities + toggle stand-still
         if js.get_button(BTN_A):
             state.vx_s = state.vy_s = state.wz_s = 0.0
             if env._ref_base_lin_vel_H is not None:
                 env._ref_base_lin_vel_H[:] = 0.0
             env._ref_base_ang_yaw_dot = 0.0
+            from quadruped_pympc.helpers.quadruped_utils import GaitType
+            pgg = controller.wb_interface.pgg
+            if pgg.gait_type != GaitType.FULL_STANCE.value:
+                pgg.set_full_stance()
+                print("  [STAND STILL]")
+            else:
+                pgg.restore_previous_gait()
+                print("  [GAIT RESUMED]")
+            time.sleep(0.3)
 
         # B: pause/resume
         if js.get_button(BTN_B):
@@ -131,15 +186,21 @@ def gamepad_thread(env, cfg, state):
             print(f"  [{'PAUSED' if env.is_paused else 'RESUMED'}]")
             time.sleep(0.3)
 
-        # Y: sit/stand toggle
+        # Y: sit/stand toggle (full PD override + full_stance)
         if js.get_button(BTN_Y):
             state.is_sitting = not state.is_sitting
+            from quadruped_pympc.helpers.quadruped_utils import GaitType
+            pgg = controller.wb_interface.pgg
             if state.is_sitting:
-                cfg.simulation_params['ref_z'] = hip_h * 0.5
-                print("  [SIT]")
+                state.vx_s = state.vy_s = state.wz_s = 0.0
+                if env._ref_base_lin_vel_H is not None:
+                    env._ref_base_lin_vel_H[:] = 0.0
+                env._ref_base_ang_yaw_dot = 0.0
+                pgg.set_full_stance()
+                print("  [SITTING]")
             else:
-                cfg.simulation_params['ref_z'] = hip_h
-                print("  [STAND]")
+                pgg.restore_previous_gait()
+                print("  [STANDING]")
             time.sleep(0.3)
 
         # Minus: reset
@@ -150,6 +211,10 @@ def gamepad_thread(env, cfg, state):
         time.sleep(0.01)
 
 
+def _print_leg_status(teleop):
+    print(f"  [LEGS] hip={teleop.front_leg_hip:+.1f}  thigh={teleop.front_leg_thigh:+.1f}  calf={teleop.front_leg_calf:+.1f}")
+
+
 def make_key_callback(env, teleop, cfg):
     """Wrap env._key_callback with front-leg and extra controls."""
     # GLFW keycodes
@@ -158,23 +223,120 @@ def make_key_callback(env, teleop, cfg):
     KEY_K = 75
     KEY_J = 74
     KEY_L = 76
+    KEY_O = 79
     KEY_R = 82
+    KEY_U = 85
+    KEY_Y = 89
+    KEY_LEFT_CTRL = 341
+    KEY_RIGHT_CTRL = 345
+    KEY_1 = 49  # trot
+    KEY_2 = 50  # pace
+    KEY_3 = 51  # crawl
+    KEY_4 = 52  # bound
+
+    GAIT_KEYS = {
+        KEY_1: ('trot', 'TROT'),
+        KEY_2: ('pace', 'PACE'),
+        KEY_3: ('crawl', 'CRAWL'),
+        KEY_4: ('bound', 'BOUND'),
+    }
 
     def callback(keycode):
-        if keycode == KEY_F:
+        # Either Ctrl: zero velocities + toggle stand-still
+        if keycode in (KEY_LEFT_CTRL, KEY_RIGHT_CTRL):
+            teleop.vx_s = teleop.vy_s = teleop.wz_s = 0.0
+            if env._ref_base_lin_vel_H is not None:
+                env._ref_base_lin_vel_H *= 0.0
+            env._ref_base_ang_yaw_dot = 0.0
+            if teleop.controller is not None:
+                from quadruped_pympc.helpers.quadruped_utils import GaitType
+                pgg = teleop.controller.wb_interface.pgg
+                if pgg.gait_type != GaitType.FULL_STANCE.value:
+                    pgg.set_full_stance()
+                    print("  [STAND STILL]")
+                else:
+                    pgg.restore_previous_gait()
+                    print("  [GAIT RESUMED]")
+            return
+
+        # 1-4: switch gait (transition through full_stance to avoid destabilizing)
+        elif keycode in GAIT_KEYS and teleop.controller is not None:
+            gait_name, label = GAIT_KEYS[keycode]
+            gait_params = cfg.simulation_params['gait_params'][gait_name]
+            pgg = teleop.controller.wb_interface.pgg
+            # Brief full stance to plant all feet before switching
+            pgg.set_full_stance()
+            # Set new gait parameters
+            pgg.duty_factor = gait_params['duty_factor']
+            pgg.step_freq = gait_params['step_freq']
+            pgg.previous_gait_type = gait_params['type']
+            # Restore into new gait (calls reset → recalculates phase offsets)
+            pgg.restore_previous_gait()
+            cfg.simulation_params['gait'] = gait_name
+            print(f"  [GAIT: {label}]")
+
+        # Y: sit/stand toggle
+        elif keycode == KEY_Y:
+            teleop.is_sitting = not teleop.is_sitting
+            if teleop.controller is not None:
+                from quadruped_pympc.helpers.quadruped_utils import GaitType
+                pgg = teleop.controller.wb_interface.pgg
+                if teleop.is_sitting:
+                    teleop.vx_s = teleop.vy_s = teleop.wz_s = 0.0
+                    if env._ref_base_lin_vel_H is not None:
+                        env._ref_base_lin_vel_H *= 0.0
+                    env._ref_base_ang_yaw_dot = 0.0
+                    pgg.set_full_stance()
+                    print("  [SITTING]")
+                else:
+                    pgg.restore_previous_gait()
+                    print("  [STANDING]")
+
+        # F: toggle front leg mode (enters full_stance to prevent MPC fight)
+        elif keycode == KEY_F:
             teleop.front_leg_mode = not teleop.front_leg_mode
-            if not teleop.front_leg_mode:
-                teleop.front_leg_rx = 0.0
-                teleop.front_leg_ry = 0.0
+            if teleop.controller is not None:
+                from quadruped_pympc.helpers.quadruped_utils import GaitType
+                pgg = teleop.controller.wb_interface.pgg
+                if teleop.front_leg_mode:
+                    teleop.vx_s = teleop.vy_s = teleop.wz_s = 0.0
+                    if env._ref_base_lin_vel_H is not None:
+                        env._ref_base_lin_vel_H *= 0.0
+                    env._ref_base_ang_yaw_dot = 0.0
+                    pgg.set_full_stance()
+                else:
+                    teleop.front_leg_hip = 0.0
+                    teleop.front_leg_thigh = 0.0
+                    teleop.front_leg_calf = 0.0
+                    if not teleop.is_sitting:
+                        pgg.restore_previous_gait()
             print(f"  [LEGS {'ON' if teleop.front_leg_mode else 'OFF'}]")
-        elif keycode == KEY_I:
-            teleop.front_leg_ry = min(teleop.front_leg_ry + 0.25, 1.0)
-        elif keycode == KEY_K:
-            teleop.front_leg_ry = max(teleop.front_leg_ry - 0.25, -1.0)
-        elif keycode == KEY_J:
-            teleop.front_leg_rx = max(teleop.front_leg_rx - 0.25, -1.0)
-        elif keycode == KEY_L:
-            teleop.front_leg_rx = min(teleop.front_leg_rx + 0.25, 1.0)
+
+        # Front leg joint control (auto-enables leg mode + full_stance)
+        # I/K = thigh raise/lower, U/O = calf extend/retract, J/L = hip abduction
+        elif keycode in (KEY_I, KEY_K, KEY_U, KEY_O, KEY_J, KEY_L):
+            if not teleop.front_leg_mode:
+                teleop.front_leg_mode = True
+                if teleop.controller is not None:
+                    teleop.vx_s = teleop.vy_s = teleop.wz_s = 0.0
+                    if env._ref_base_lin_vel_H is not None:
+                        env._ref_base_lin_vel_H *= 0.0
+                    env._ref_base_ang_yaw_dot = 0.0
+                    teleop.controller.wb_interface.pgg.set_full_stance()
+            if keycode == KEY_I:
+                teleop.front_leg_thigh = min(teleop.front_leg_thigh + 0.3, 1.5)
+            elif keycode == KEY_K:
+                teleop.front_leg_thigh = max(teleop.front_leg_thigh - 0.3, -1.5)
+            elif keycode == KEY_U:
+                teleop.front_leg_calf = min(teleop.front_leg_calf + 0.3, 1.0)
+            elif keycode == KEY_O:
+                teleop.front_leg_calf = max(teleop.front_leg_calf - 0.3, -1.0)
+            elif keycode == KEY_J:
+                teleop.front_leg_hip = max(teleop.front_leg_hip - 0.3, -1.0)
+            elif keycode == KEY_L:
+                teleop.front_leg_hip = min(teleop.front_leg_hip + 0.3, 1.0)
+            _print_leg_status(teleop)
+
         elif keycode == KEY_R:
             teleop.reset_requested = True
         else:
@@ -183,39 +345,61 @@ def make_key_callback(env, teleop, cfg):
     return callback
 
 
-def compute_front_leg_pd(env, state, legs_order):
-    """Override front leg torques with PD control when L bumper is held."""
-    if not state.front_leg_mode:
-        return None
+def compute_pose_override(env, state, legs_order, dt):
+    """Override leg torques for sit mode and/or front leg mode.
 
+    Returns dict of {leg_name: torque_array} for legs that should be overridden,
+    or None if no override needed.
+    """
+    # Update sit blend (smooth transition over ~1s)
+    blend_rate = dt * 2.0  # reach full sit in ~0.5s
+    if state.is_sitting:
+        state.sit_blend = min(state.sit_blend + blend_rate, 1.0)
+    else:
+        state.sit_blend = max(state.sit_blend - blend_rate, 0.0)
+
+    overrides = {}
     kp, kd = 40.0, 4.0
 
-    # Standing pose targets
-    hip_target = 0.0
-    thigh_target = 0.9
-    calf_target = -1.8
+    # Sit mode: PD control ALL legs toward sit pose
+    if state.sit_blend > 0.01:
+        for leg in legs_order:
+            idx = env.legs_qpos_idx[leg]
+            q = env.mjData.qpos[idx]
+            dq = env.mjData.qvel[env.legs_qvel_idx[leg]]
 
-    # Modulate with right stick
-    thigh_target += state.front_leg_ry * 0.5   # forward/back
-    hip_target += state.front_leg_rx * 0.3     # abduction
+            # Blend between standing and sitting targets
+            targets = (1.0 - state.sit_blend) * STAND_TARGETS[leg] + \
+                      state.sit_blend * SIT_TARGETS[leg]
+            torque = kp * (targets - q) + kd * (0.0 - dq)
+            overrides[leg] = torque
 
-    front_torques = {}
-    for leg in ["FL", "FR"]:
-        idx = env.legs_qpos_idx[leg]
-        q = env.mjData.qpos[idx]
-        dq = env.mjData.qvel[env.legs_qvel_idx[leg]]
-
+    # Front leg mode: override front legs with manual control
+    # Base targets match current pose (sit vs stand), offsets add on top
+    if state.front_leg_mode:
+        if state.is_sitting:
+            base = SIT_TARGETS["FL"]  # [0.0, 0.88, -0.94]
+        else:
+            base = STAND_TARGETS["FL"]  # [0.0, 0.9, -1.8]
+        hip_target = base[0] + state.front_leg_hip * 0.4
+        thigh_target = base[1] + state.front_leg_thigh * 0.8
+        calf_target = base[2] + state.front_leg_calf * 0.6
         targets = np.array([hip_target, thigh_target, calf_target])
-        torque = kp * (targets - q) + kd * (0.0 - dq)
-        front_torques[leg] = torque
 
-    return front_torques
+        for leg in ["FL", "FR"]:
+            idx = env.legs_qpos_idx[leg]
+            q = env.mjData.qpos[idx]
+            dq = env.mjData.qvel[env.legs_qvel_idx[leg]]
+            torque = kp * (targets - q) + kd * (0.0 - dq)
+            overrides[leg] = torque
+
+    return overrides if overrides else None
 
 
 def main():
     parser = argparse.ArgumentParser(description="Quadruped-PyMPC Teleop")
     parser.add_argument("--gamepad", action="store_true")
-    parser.add_argument("--scene", choices=["flat", "random_boxes", "random_pyramids", "perlin"], default="flat")
+    parser.add_argument("--scene", choices=["flat", "random_boxes", "random_pyramids", "perlin", "fetch", "unitree"], default="flat")
     parser.add_argument("--gait", choices=["trot", "pace", "crawl", "bound"], default="trot")
     parser.add_argument("--mpc", choices=["nominal", "sampling", "input_rates"], default="nominal")
     args = parser.parse_args()
@@ -247,6 +431,12 @@ def main():
         env.mjModel.qpos0 = np.concatenate((env.mjModel.qpos0[:7], cfg.qpos0_js))
 
     env.reset(random=False)
+
+    # ── Set initial position for custom scenes ────────────────────────────
+    if args.scene == "fetch":
+        # Place Go2 on top of the platform (top z=0.30, standing height ~0.28)
+        env.mjData.qpos[0:3] = [0.70, 0.0, 0.58]
+        mujoco.mj_forward(env.mjModel, env.mjData)
 
     # ── Teleop state (created before viewer so key callback can reference it)
     teleop = TeleopState(hip_height)
@@ -289,9 +479,11 @@ def main():
         ),
     )
 
+    teleop.controller = controller
+
     # ── Start gamepad ─────────────────────────────────────────────────────
     if args.gamepad:
-        threading.Thread(target=gamepad_thread, args=(env, cfg, teleop), daemon=True).start()
+        threading.Thread(target=gamepad_thread, args=(env, cfg, teleop, controller), daemon=True).start()
 
     # ── Print controls ────────────────────────────────────────────────────
     print("\n=== Quadruped-PyMPC Teleop ===")
@@ -300,18 +492,21 @@ def main():
         print("  Right stick X    : turn left/right")
         print("  ZL               : creep (0.3x)")
         print("  ZR               : sprint (2x)")
-        print("  A                : e-stop (zero velocities)")
+        print("  A                : stand still / resume gait")
         print("  B                : pause/resume")
-        print("  Y                : sit/stand toggle")
-        print("  L (hold)         : front leg mode (right stick controls legs)")
+        print("  Y                : sit / stand up")
+        print("  L (hold)         : front leg mode (R-stick: hip/thigh, ZL/ZR: calf)")
         print("  Minus            : reset simulation")
     print("  Arrow Up/Down    : forward/back")
     print("  Arrow Left/Right : turn")
-    print("  Ctrl             : stop all motion")
+    print("  Ctrl (L or R)    : stand still / resume gait")
     print("  Space            : pause/resume")
-    print("  F                : toggle front leg mode")
-    print("  I/K              : front legs forward/back")
-    print("  J/L              : front legs abduct left/right")
+    print("  Y                : sit / stand up")
+    print("  1/2/3/4          : gait — trot / pace / crawl / bound")
+    print("  F                : toggle front leg mode (F again to release)")
+    print("  I/K              : thigh raise / lower")
+    print("  U/O              : calf extend / retract")
+    print("  J/L              : hip abduct left / right")
     print("  R                : reset simulation")
     print()
 
@@ -330,6 +525,9 @@ def main():
             teleop.is_sitting = False
             cfg.simulation_params['ref_z'] = hip_height
             env.reset(random=False)
+            if args.scene == "fetch":
+                env.mjData.qpos[0:3] = [0.70, 0.0, 0.58]
+                mujoco.mj_forward(env.mjModel, env.mjData)
             controller.reset(initial_feet_pos=env.feet_pos(frame="world"))
             print("  [RESET]")
             continue
@@ -373,11 +571,11 @@ def main():
             legs_qpos_idx, legs_qvel_idx, tau, inertia, env.mjData.contact,
         )
 
-        # Override front legs if in front leg mode
-        front_pd = compute_front_leg_pd(env, teleop, legs_order)
-        if front_pd is not None:
-            for leg in ["FL", "FR"]:
-                tau[leg] = front_pd[leg]
+        # Override legs for sit mode / front leg mode
+        pose_overrides = compute_pose_override(env, teleop, legs_order, simulation_dt)
+        if pose_overrides is not None:
+            for leg, torque in pose_overrides.items():
+                tau[leg] = torque
 
         # Clip torques
         for leg in legs_order:
